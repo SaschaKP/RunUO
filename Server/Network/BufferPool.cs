@@ -18,85 +18,75 @@
  *
  ***************************************************************************/
 
-using System;
-using System.Collections;
 using System.Collections.Generic;
+using System.Collections.Concurrent;
+using System.Threading;
 
-namespace Server.Network
+public class BufferPool
 {
-	public class BufferPool
-	{
-		private static List<BufferPool> m_Pools = new List<BufferPool>();
+    private static readonly List<BufferPool> m_Pools = new List<BufferPool>();
+    public static List<BufferPool> Pools => m_Pools;
 
-		public static List<BufferPool> Pools{ get{ return m_Pools; } set{ m_Pools = value; } }
+    private readonly ConcurrentStack<byte[]> m_FreeBuffers = new();
 
-		private string m_Name;
+    private readonly string m_Name;
+    private readonly int m_InitialCapacity;
+    private readonly int m_BufferSize;
+    private int m_Misses;
+    private int m_CurrentCreated; // Tracking of created arrays
 
-		private int m_InitialCapacity;
-		private int m_BufferSize;
+    public BufferPool(string name, int initialCapacity, int bufferSize)
+    {
+        m_Name = name;
+        m_InitialCapacity = initialCapacity;
+        m_BufferSize = bufferSize;
+        m_CurrentCreated = initialCapacity;
 
-		private int m_Misses;
+        // Pre-allocate valid contiguous memory array: One single block to avoid LOH
+        for (int i = 0; i < initialCapacity; ++i)
+        {
+            m_FreeBuffers.Push(new byte[bufferSize]);
+        }
 
-		private Queue<byte[]> m_FreeBuffers;
+        lock (m_Pools) { m_Pools.Add(this); }
+    }
 
-		public void GetInfo( out string name, out int freeCount, out int initialCapacity, out int currentCapacity, out int bufferSize, out int misses )
-		{
-			lock ( this )
-			{
-				name = m_Name;
-				freeCount = m_FreeBuffers.Count;
-				initialCapacity = m_InitialCapacity;
-				currentCapacity = m_InitialCapacity * (1 + m_Misses);
-				bufferSize = m_BufferSize;
-				misses = m_Misses;
-			}
-		}
+    public byte[] AcquireBuffer()
+    {
+        if (m_FreeBuffers.TryPop(out byte[] buffer))
+        {
+            return buffer;
+        }
 
-		public BufferPool( string name, int initialCapacity, int bufferSize )
-		{
-			m_Name = name;
+        // Increment misses and create a new buffer
+        Interlocked.Increment(ref m_Misses);
+        Interlocked.Increment(ref m_CurrentCreated);
 
-			m_InitialCapacity = initialCapacity;
-			m_BufferSize = bufferSize;
+        return new byte[m_BufferSize];
+    }
 
-			m_FreeBuffers = new Queue<byte[]>( initialCapacity );
+    public void ReleaseBuffer(byte[] buffer)
+    {
+        // Don't allow null or external buffers here
+        if (buffer == null || buffer.Length != m_BufferSize)
+            return;
 
-			for ( int i = 0; i < initialCapacity; ++i )
-				m_FreeBuffers.Enqueue( new byte[bufferSize] );
+        m_FreeBuffers.Push(buffer);
+    }
 
-			lock ( m_Pools )
-				m_Pools.Add( this );
-		}
+    public void GetInfo(out string name, out int freeCount, out int initialCapacity, out int currentCapacity, out int bufferSize, out int misses)
+    {
+        name = m_Name;
+        freeCount = m_FreeBuffers.Count;
+        initialCapacity = m_InitialCapacity;
+        currentCapacity = Volatile.Read(ref m_CurrentCreated);
+        bufferSize = m_BufferSize;
+        misses = Volatile.Read(ref m_Misses);
+    }
 
-		public byte[] AcquireBuffer()
-		{
-			lock ( this )
-			{
-				if ( m_FreeBuffers.Count > 0 )
-					return m_FreeBuffers.Dequeue();
-
-				++m_Misses;
-
-				for ( int i = 0; i < m_InitialCapacity; ++i )
-					m_FreeBuffers.Enqueue( new byte[m_BufferSize] );
-
-				return m_FreeBuffers.Dequeue();
-			}
-		}
-
-		public void ReleaseBuffer( byte[] buffer )
-		{
-			if ( buffer == null )
-				return;
-
-			lock ( this )
-				m_FreeBuffers.Enqueue( buffer );
-		}
-
-		public void Free()
-		{
-			lock ( m_Pools )
-				m_Pools.Remove( this );
-		}
-	}
+    public void Free()
+    {
+        lock (m_Pools) { m_Pools.Remove(this); }
+        m_FreeBuffers.Clear();
+    }
 }
